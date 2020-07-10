@@ -3,30 +3,38 @@ import os
 import argparse
 import errno
 import pandas as pd
+import boto3
+from botocore import UNSIGNED
+from botocore.config import Config
 from tqdm import tqdm
 from multiprocessing.pool import ThreadPool
-from time import time as timer
 
 argparser = argparse.ArgumentParser(description='Download specific objects from Open-Images dataset')
-argparser.add_argument('-a', '--annots',
+argparser.add_argument('-a', '--annots', default="/home/malnakli/scratch/datasets/openimages/validation-annotations-bbox.csv",
                        help='path to annotations file (.csv)')
 argparser.add_argument('-o', '--objects', nargs='+',
                        help='download images of these objects')
-argparser.add_argument('-d', '--dir',
+argparser.add_argument('-d', '--dir', default="/home/malnakli/scratch/datasets/openimages/images/validation",
                        help='path to output directory')
-argparser.add_argument('-l', '--labelmap',
+argparser.add_argument('-l', '--labelmap', default="/home/malnakli/scratch/datasets/openimages/class-descriptions-boxable.csv",
                        help='path to labelmap (.csv)')
-argparser.add_argument('-i', '--images',
-                       help='path to file containing links to images (.csv)')
+argparser.add_argument('-s3b', '--s3_bucket', default="open-images-dataset",
+                       help="https://github.com/cvdfoundation/open-images-dataset#download-images-with-bounding-boxes-annotations")
+
+argparser.add_argument('-s3o', '--s3_object', default="validation",
+                       help="https://github.com/cvdfoundation/open-images-dataset#download-images-with-bounding-boxes-annotations")
 
 args = argparser.parse_args()
 
-# parse arguments
+# # parse arguments
 ANNOTATIONS = args.annots
 OUTPUT_DIR = args.dir
 OBJECTS = args.objects
 LABELMAP = args.labelmap
-IMAGES = args.images
+
+s3 = boto3.client('s3',config=Config(signature_version=UNSIGNED))
+s3_BUCKET_NAME = args.s3_bucket
+s3_OBJECT_NAME = args.s3_object
 
 # make OUTPUT_DIR if not present
 if not os.path.isdir(OUTPUT_DIR):
@@ -51,13 +59,13 @@ def get_ooi_labelmap(labelmap):
 
     object_codes = {}
     for idx, row in labelmap.iterrows():
-        if any(obj.lower() in row[1].lower() for obj in OBJECTS):
+        if any(obj.lower() == row[1].lower() for obj in OBJECTS):
             object_codes[row[1].lower()] = row[0]
 
     return object_codes
 
 
-def generate_download_list(annotations, labelmap, base_url):
+def generate_download_list(annotations, labelmap):
     '''
     Parse through input annotations dataframe, find ImageID's of objects of interest,
     and get download urls for the corresponding images
@@ -76,6 +84,7 @@ def generate_download_list(annotations, labelmap, base_url):
         df_download = df_download.append(annotations.loc[annotations['LabelName'] == value, ['ImageID', 'LabelName']])
 
     ######################
+    df_download.drop_duplicates()
     url_download_list = []
 
     for idx, row in df_download.iterrows():
@@ -84,42 +93,24 @@ def generate_download_list(annotations, labelmap, base_url):
 
         # check if the image exists in directory
         if not os.path.exists(os.path.join(OUTPUT_DIR, image_name)):
-            # form url
-            url = os.path.join(base_url, image_name)
-
-            url_download_list.append(url)
+            url_download_list.append(image_name)
 
     return url_download_list
 
 
-def download_objects_of_interest(download_list):
-    def fetch_url(url):
+def download_objects_of_interest(download_list):        
+
+    for image in tqdm(download_list, desc="Download %: "):
         try:
-            urllib.request.urlretrieve(url, os.path.join(OUTPUT_DIR, url.split("/")[-1]))
-            return url, None
+            with open(f"{OUTPUT_DIR}/{image}", "wb") as dest_file:
+                s3.download_fileobj(s3_BUCKET_NAME, f"{s3_OBJECT_NAME}/{image}", dest_file)
+        
         except Exception as e:
-            return None, e
-
-    start = timer()
-    results = ThreadPool(20).imap_unordered(fetch_url, download_list)
-
-    df_pbar = tqdm(total=len(download_list), position=1, desc="Download %: ")
-
-    for url, error in results:
-        df_pbar.update(1)
-        if error is None:
-            pass  # TODO: find a way to do tqdm.write() with a refresh
-            # print("{} fetched in {}s".format(url, timer() - start), end='\r')
-        else:
-            pass  # TODO: find a way to do tqdm.write() with a refresh
-            # print("error fetching {}: {}".format(url, error), end='\r')
+            print("error fetching {}: {}".format(image, e))
+        
 
 
 def main():
-    # read images and get base_url
-    df_images = pd.read_csv(IMAGES)
-    base_url = os.path.dirname(df_images['image_url'][0])  # used to download the images
-
     # read labelmap
     df_oid_labelmap = pd.read_csv(LABELMAP)  # open images dataset (oid) labelmap
     ooi_labelmap = get_ooi_labelmap(df_oid_labelmap)  # objects of interest (ooi) labelmap
@@ -131,12 +122,11 @@ def main():
 
     # get url list to download
     download_list = generate_download_list(annotations=df_annotations,
-                                           labelmap=ooi_labelmap,
-                                           base_url=base_url)
-
+                                           labelmap=ooi_labelmap)
+    print("\n# Images to dwonload",len(download_list))
     # download objects of interest
-    download_objects_of_interest(download_list)
-
+    download_objects_of_interest(download_list[:2])
+    #s3.download_file(s3_BUCKET_NAME, s3_OBJECT_NAME, download_list[0])
     print("\nFinished downloads.")
 
 
